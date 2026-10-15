@@ -1,0 +1,107 @@
+# Phase 4 - the complete prototype (default).
+# Same capabilities as phase 3, plus the confirmation layer: destructive
+# actions (deleting, overwriting, signalling processes, fetching from hosts
+# outside the allow-list) run only after the user approves them.
+
+[policy]
+name = "phase4-full"
+description = "Phase 4: full prototype; destructive actions require your confirmation"
+
+[workspace]
+root = "~/agentlayer-workspace"
+
+[agent]
+max_steps = 16
+max_tool_output = 6000
+
+[audit]
+path = "~/.local/state/agentlayer/audit.jsonl"
+
+[deny]
+paths = [
+    "~/.ssh/**", "~/.gnupg/**", "~/.aws/**", "~/.kube/**", "~/.docker/**",
+    "~/.config/agentlayer/**", "~/.local/share/keyrings/**", "~/.password-store/**",
+    "**/.env", "**/.env.*", "**/*.pem", "**/*.key", "**/id_rsa*", "**/id_ed25519*", "**/.netrc",
+    "/etc/shadow", "/etc/gshadow", "/etc/sudoers", "/etc/sudoers.d/**",
+]
+
+[[grant]]
+right = "fs.read"
+paths = [
+    "{workspace}/**",
+    "/proc/**",
+    "/etc/os-release", "/etc/hostname", "/etc/hosts", "/etc/passwd", "/etc/group",
+    "/usr/share/doc/**", "/usr/include/**",
+]
+
+[[grant]]
+right = "fs.write"
+paths = ["{workspace}/**"]
+confirm_overwrite = true   # replacing existing content shows a diff and asks first
+
+[[grant]]
+right = "fs.delete"
+paths = ["{workspace}/**"]
+confirm = true
+
+[[grant]]
+right = "exec"
+sandbox = "auto"
+network = false
+timeout = 30
+max_timeout = 120
+programs = [
+    "ls", "cat", "head", "tail", "wc", "grep", "find", "sort", "uniq", "cut", "tr", "nl", "tac", "rev",
+    "echo", "printf", "date", "cal", "pwd", "stat", "file", "du", "diff", "cmp", "comm",
+    "md5sum", "sha1sum", "sha256sum", "base64", "basename", "dirname", "realpath", "tree", "column",
+    "seq", "sleep", "true", "false", "yes", "expr", "factor", "bc", "jq", "xargs",
+    "uptime", "free", "uname", "whoami", "id", "nproc", "lscpu", "getconf",
+    "python3", "bash", "sh", "awk", "sed", "gcc", "cc", "g++", "make", "git", "tar", "gzip", "gunzip", "zip", "unzip",
+]
+sandboxed_only = ["python3", "bash", "sh", "awk", "sed", "xargs", "gcc", "cc", "g++", "make", "git", "tar", "zip", "unzip"]
+workspace_programs = true   # ./a.out built in the workspace (sandbox only)
+confirm_programs = []
+[grant.deny_args]
+find = ["-delete", "-exec*", "-ok*", "-fprint*", "-fls"]
+git = ["push", "clean", "filter-branch"]
+[grant.limits]
+cpu_seconds = 30
+memory_mb = 2048
+file_size_mb = 64
+open_files = 256
+
+[[grant]]
+right = "net.read"
+hosts = [
+    "*.wikipedia.org", "*.wikimedia.org", "docs.python.org", "man7.org", "*.kernel.org",
+    "api.github.com", "raw.githubusercontent.com", "github.com", "pypi.org", "wttr.in",
+    "httpbin.org", "example.com", "*.stackexchange.com", "stackoverflow.com",
+]
+confirm_unlisted = true    # other public hosts are allowed after confirmation
+allow_private = false
+
+[[grant]]
+right = "proc.read"
+scope = "all"
+
+[[grant]]
+right = "proc.signal"
+scope = "own"
+confirm = true
+signals = ["SIGTERM", "SIGINT", "SIGHUP", "SIGKILL", "SIGSTOP", "SIGCONT", "SIGUSR1", "SIGUSR2"]
+protect = [
+    "systemd", "init", "sshd", "dbus-daemon", "dbus-broker", "Xorg", "Xwayland", "gnome-shell", "gnome-session*",
+    "plasmashell", "kwin_*", "ksmserver", "sddm*", "gdm*", "pipewire*", "wireplumber", "pulseaudio",
+    "NetworkManager", "polkitd", "login", "agetty", "tmux*", "screen", "ollama",
+]
+
+[[grant]]
+right = "proc.priority"
+scope = "own"
+protect = ["systemd", "Xorg", "Xwayland", "gnome-shell", "plasmashell", "kwin_*", "pipewire*"]
+
+[[grant]]
+right = "sys.read"
+
+[[grant]]
+right = "memory"     # long-term notes (agent state only; cannot change the OS)

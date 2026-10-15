@@ -1,0 +1,45 @@
+# Phase 1 - read-only inspection.
+# The agent can look at the workspace, the process table and the system,
+# but it holds no right that changes anything.
+
+[policy]
+name = "phase1-readonly"
+description = "Phase 1: read-only inspection of the workspace, processes and system"
+
+[workspace]
+root = "~/agentlayer-workspace"
+
+[agent]
+max_steps = 12
+max_tool_output = 6000
+
+[audit]
+path = "~/.local/state/agentlayer/audit.jsonl"
+
+# Deny rules override every grant below.
+[deny]
+paths = [
+    "~/.ssh/**", "~/.gnupg/**", "~/.aws/**", "~/.kube/**", "~/.docker/**",
+    "~/.config/agentlayer/**", "~/.local/share/keyrings/**", "~/.password-store/**",
+    "**/.env", "**/.env.*", "**/*.pem", "**/*.key", "**/id_rsa*", "**/id_ed25519*", "**/.netrc",
+    "/etc/shadow", "/etc/gshadow", "/etc/sudoers", "/etc/sudoers.d/**",
+]
+
+[[grant]]
+right = "fs.read"
+paths = [
+    "{workspace}/**",
+    "/proc/**",
+    "/etc/os-release", "/etc/hostname", "/etc/hosts", "/etc/passwd", "/etc/group",
+    "/usr/share/doc/**", "/usr/include/**",
+]
+
+[[grant]]
+right = "proc.read"
+scope = "all"
+
+[[grant]]
+right = "sys.read"
+
+[[grant]]
+right = "memory"     # long-term notes (agent state only; cannot change the OS)

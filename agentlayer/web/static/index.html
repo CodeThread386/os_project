@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="agentlayer-token" content="__TOKEN__">
+  <title>AgentLayer</title>
+  <link rel="icon" href="/icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <img src="/icon.svg" alt="" width="30" height="30">
+      <div>
+        <div class="brand-name">AgentLayer</div>
+        <div class="brand-sub">agentic control layer for Linux</div>
+      </div>
+    </div>
+    <div class="chips" id="chips"></div>
+    <div class="top-actions">
+      <label class="toggle" title="Simulate changes instead of making them"><input type="checkbox" id="dryrun"><span>Dry run</span></label>
+      <label class="toggle" title="Read answers aloud (in your browser)"><input type="checkbox" id="speak"><span>Speak</span></label>
+      <span id="conn" class="conn" title="connecting…"></span>
+    </div>
+  </header>
+
+  <div class="layout">
+    <nav class="sidebar" id="nav">
+      <button data-view="chat" class="active"><span class="ico">💬</span><span>Chat</span></button>
+      <button data-view="monitor"><span class="ico">📈</span><span>Monitor</span></button>
+      <button data-view="matrix"><span class="ico">🛡️</span><span>Access matrix</span></button>
+      <button data-view="audit"><span class="ico">📜</span><span>Audit log</span></button>
+      <button data-view="undo"><span class="ico">↶</span><span>Undo</span></button>
+      <button data-view="memory"><span class="ico">🧠</span><span>Memory</span></button>
+      <button data-view="sessions"><span class="ico">🗂️</span><span>Sessions</span></button>
+      <button data-view="tasks"><span class="ico">⏰</span><span>Tasks</span></button>
+      <button data-view="tools"><span class="ico">🧰</span><span>Tools</span></button>
+      <button data-view="quota"><span class="ico">🔑</span><span>Quota</span></button>
+      <div class="sidebar-foot" id="usage"></div>
+    </nav>
+
+    <main>
+      <section id="view-chat" class="view active">
+        <div id="messages" class="messages">
+          <div class="welcome" id="welcome">
+            <img src="/icon.svg" alt="" width="56" height="56">
+            <h1>What should your computer do?</h1>
+            <p>Every action is checked by the capability broker, risky ones ask you first, and everything is recorded in a tamper-evident audit log.</p>
+            <div class="suggestions" id="suggestions"></div>
+          </div>
+        </div>
+        <div id="thinking" class="thinking hidden"><span class="spinner"></span><span>planning…</span></div>
+        <form id="composer" class="composer" autocomplete="off">
+          <textarea id="input" rows="1" placeholder="Ask AgentLayer… (Enter to send, Shift+Enter for a new line)"></textarea>
+          <button type="button" id="mic" class="icon-btn" title="Speak a request">🎤</button>
+          <button type="button" id="stop" class="btn danger hidden">Stop</button>
+          <button type="submit" id="send" class="btn primary">Send</button>
+        </form>
+      </section>
+
+      <section id="view-monitor" class="view">
+        <div class="view-head"><h2>System monitor</h2><span class="muted">live from /proc and /sys, every 2 s</span></div>
+        <div class="grid" id="monitor-cards"></div>
+        <div class="two-col">
+          <div class="card"><h3>Top CPU</h3><table class="table" id="top-cpu"></table></div>
+          <div class="card"><h3>Top memory</h3><table class="table" id="top-mem"></table></div>
+        </div>
+      </section>
+
+      <section id="view-matrix" class="view">
+        <div class="view-head"><h2>Access matrix</h2><span class="muted" id="matrix-policy"></span></div>
+        <div class="card"><div class="legend">
+          <span class="cell c-ok">✔</span> allowed <span class="cell c-ok">✔*</span> overwrite / close / read asks
+          <span class="cell c-ask">ask</span> needs your approval <span class="cell c-deny">✖</span> denied (overrides grants)
+          <span class="cell c-temp">temp</span> temporary grant</div>
+          <div class="scroll"><table class="matrix" id="matrix"></table></div></div>
+        <div class="card"><h3>Temporary capabilities</h3><div id="grants"></div></div>
+        <div class="card"><h3>Built-in invariants</h3><ul id="invariants" class="invariants"></ul></div>
+      </section>
+
+      <section id="view-audit" class="view">
+        <div class="view-head"><h2>Audit log</h2>
+          <button class="btn" id="verify">Verify hash chain</button><span id="verify-result" class="muted"></span></div>
+        <div class="card scroll"><table class="table" id="audit"></table></div>
+      </section>
+
+      <section id="view-undo" class="view">
+        <div class="view-head"><h2>Undo</h2><span class="muted">every file change the agent made; deletes are in the Trash</span></div>
+        <div class="card"><table class="table" id="undo"></table></div>
+      </section>
+
+      <section id="view-memory" class="view">
+        <div class="view-head"><h2>Long-term memory</h2></div>
+        <form class="card row" id="memory-form"><input id="memory-text" placeholder="Something AgentLayer should remember…"><button class="btn primary">Remember</button></form>
+        <div class="card"><table class="table" id="memory"></table></div>
+      </section>
+
+      <section id="view-sessions" class="view">
+        <div class="view-head"><h2>Saved conversations</h2><button class="btn" id="new-chat">New conversation</button></div>
+        <div class="card"><table class="table" id="sessions"></table></div>
+      </section>
+
+      <section id="view-tasks" class="view">
+        <div class="view-head"><h2>Scheduled tasks</h2><span class="muted">systemd user timers; runs are unattended</span></div>
+        <div class="card"><table class="table" id="tasks"></table></div>
+      </section>
+
+      <section id="view-tools" class="view">
+        <div class="view-head"><h2>Tools</h2><span class="muted">what each tool does underneath</span></div>
+        <div class="card scroll"><table class="table" id="tools"></table></div>
+      </section>
+
+      <section id="view-quota" class="view">
+        <div class="view-head"><h2>Groq quota</h2><span class="muted">keys grouped by organisation; budgets per model</span></div>
+        <div class="card" id="quota-groups"></div>
+        <div class="card scroll"><table class="table" id="quota"></table></div>
+      </section>
+    </main>
+  </div>
+
+  <div id="modal" class="modal hidden" role="dialog" aria-modal="true"><div class="modal-card" id="modal-card"></div></div>
+  <div id="toasts" class="toasts"></div>
+  <script src="/app.js"></script>
+</body>
+</html>
