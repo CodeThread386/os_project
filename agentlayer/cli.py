@@ -35,7 +35,7 @@ from agentlayer.policy import PolicyError, bundled_policy_names, load_policy
 from agentlayer.sandbox import Sandbox, SandboxError, detect
 from agentlayer.scheduler import ScheduleError, Scheduler
 from agentlayer.tools import REGISTRY, ToolArgError, ToolContext, all_tools, exposed_tools, prepare_args
-from agentlayer.ui import ConsoleEvents, audit_table, print_policy
+from agentlayer.ui import ConsoleEvents, audit_table, print_policy, print_matrix
 
 def banner(console: Console, rt: Runtime, llm, agent: Agent | None = None) -> None:
     pol = rt.policy
@@ -71,6 +71,10 @@ HELP = r"""[bold]Conversation[/]
   /undo \[id|list]   undo the agent's last change     /dryrun on|off simulate changes instead of making them
   /grants           temporary capabilities          /revoke \[id]   revoke one (or all)
   /policy           the access matrix               /audit \[n]     the last n audit records · /verify
+[bold]OS Lab demos[/]
+  /trace \[cmd]      syscall trace for a command      /ps \[pid|kill|zombie]  PCB viewer + signal demo
+  /limits \[stress]  resource limits in effect        /sched \[all|fcfs|sjf|rr|priority]  CPU scheduler
+  /ipc               privilege separation demo        /matrix         Lampson access matrix
 [bold]More[/]
   /tools            tools, groups and syscalls      /tasks         scheduled tasks
   /memory           long-term notes · /forget id    /quota         Groq key pool · /usage tokens used
@@ -223,6 +227,545 @@ def _toggle(value: str, current: bool) -> bool:
     return {"on": True, "off": False, "": not current}.get(value, current)
 
 
+# ================================================================= OS lab helpers
+
+
+def _cmd_trace(console: Console, rt: Runtime, rest: str) -> None:
+    """'/trace [command]' — run a command under strace -c and show syscall stats.
+
+    Bridges Module 2 (user/kernel boundary): shows how a high-level instruction
+    becomes low-level system calls with categories and error counts.
+    """
+    import shutil
+    from rich import box
+    from rich.table import Table
+
+    if not shutil.which("strace"):
+        console.print("[red]strace is not installed.[/] Install it with: [dim]sudo apt install strace[/]")
+        return
+
+    command = rest.strip() or "ls"
+    console.print(f"[bold]Syscall trace:[/] [cyan]{command}[/]  [dim](strace -c)[/]")
+
+    # Parse into argv tokens (simple split; no shell expansion)
+    argv = command.split()
+
+    import subprocess, re, os
+    real_bin = shutil.which(argv[0]) if "/" not in argv[0] else argv[0]
+    if real_bin is None:
+        console.print(f"[red]{argv[0]!r} not found in PATH.[/]")
+        return
+
+    try:
+        result = subprocess.run(
+            ["strace", "-c", "-o", "/dev/stderr", real_bin] + argv[1:],
+            capture_output=True, text=True, timeout=30,
+        )
+    except subprocess.TimeoutExpired:
+        console.print("[red]strace timed out after 30 s[/]")
+        return
+    except OSError as exc:
+        console.print(f"[red]strace failed:[/] {exc}")
+        return
+
+    raw = result.stderr
+    # strace -c output: "% time  seconds  usecs/call  calls  errors  syscall"
+    rows, total_calls, total_errors = [], 0, 0
+    in_table = False
+    for line in raw.splitlines():
+        if line.startswith("% time"):
+            in_table = True
+            continue
+        if not in_table:
+            continue
+        line = line.strip()
+        if not line or line.startswith("---") or line.startswith("100.00"):
+            continue
+        parts = line.split()
+        if len(parts) < 5:
+            continue
+        try:
+            pct, secs, us, calls = float(parts[0]), parts[1], parts[2], int(parts[3])
+            errs = int(parts[4]) if len(parts) >= 6 else 0
+            name = parts[-1]
+        except (ValueError, IndexError):
+            continue
+        total_calls += calls
+        total_errors += errs
+        rows.append((pct, secs, calls, errs, name))
+
+    rows.sort(key=lambda r: -r[0])
+
+    # Syscall educational categories (Module 2 mapping)
+    CATEGORIES: dict[str, str] = {
+        "openat": "file I/O", "open": "file I/O", "read": "file I/O", "write": "file I/O",
+        "close": "file I/O", "stat": "file I/O", "fstat": "file I/O", "lstat": "file I/O",
+        "getdents64": "directory", "getdents": "directory",
+        "mmap": "memory", "mprotect": "memory", "munmap": "memory", "brk": "memory",
+        "execve": "process", "clone": "process", "fork": "process", "wait4": "process",
+        "pipe": "IPC", "socket": "network", "connect": "network", "sendto": "network",
+        "rt_sigaction": "signals", "rt_sigprocmask": "signals", "kill": "signals",
+        "ioctl": "device", "fcntl": "file ctrl",
+    }
+
+    tbl = Table(title=f"Syscall summary: {command!r}", box=box.SIMPLE_HEAD, pad_edge=False)
+    for col in ("%time", "calls", "errors", "category", "syscall"):
+        tbl.add_column(col, justify="right" if col in ("%time", "calls", "errors") else "left")
+    for pct, _, calls, errs, name in rows[:25]:
+        cat = CATEGORIES.get(name, "other")
+        err_cell = f"[red]{errs}[/]" if errs else "[dim]0[/]"
+        tbl.add_row(f"{pct:.1f}", str(calls), err_cell, f"[dim]{cat}[/]", f"[cyan]{name}[/]")
+    console.print(tbl)
+
+    # Plain-English narrative (the "bridge" sentence)
+    top_names = ", ".join(r[4] for r in rows[:5]) if rows else "none"
+    console.print(
+        f"\n[bold]Your command[/] [cyan]{command!r}[/] [bold]became[/] "
+        f"[green]{total_calls}[/] kernel crossings (syscalls)"
+        + (f", [red]{total_errors} returned errors[/]" if total_errors else "")
+        + f".\n[dim]Most frequent: {top_names}[/]"
+    )
+    console.print(
+        "[dim]Each crossing is a user→kernel mode switch: the CPU saves registers, "
+        "enters ring 0, executes the kernel handler, then returns to ring 3.[/]"
+    )
+
+
+def _cmd_ps(console: Console, rt: Runtime, rest: str) -> None:
+    """'/ps [pid|kill <pid> <sig>|zombie]' — PCB viewer and signal demo.
+
+    Demonstrates Module 2: process states, PCBs, signals, zombie reaping.
+    """
+    from rich import box
+    from rich.table import Table
+    from agentlayer import procfs
+    from agentlayer.tools.base import fmt_bytes, fmt_duration, fmt_time
+    import time, os, signal
+
+    parts = rest.split()
+    sub = parts[0].lower() if parts else ""
+
+    # ── /ps zombie: fork a child, let it become a zombie, then reap it ─────
+    if sub == "zombie":
+        console.print("[bold]Zombie process demo[/]  [dim](Module 2: PCB lifecycle)[/]")
+        console.print("[dim]Forking a child that exits immediately while the parent delays wait()…[/]")
+        pid = os.fork()
+        if pid == 0:
+            os._exit(0)     # child exits immediately → zombie
+        import time as _t
+        _t.sleep(0.3)       # parent sleeps — child is now Z state
+        st = procfs.read_stat(pid)
+        state = st.state if st else "gone"
+        console.print(
+            f"  child PID [bold]{pid}[/] state: [bold yellow]{state}[/]"
+            + (" — it exited but its PCB is not yet freed (zombie)" if state == "Z" else "")
+        )
+        os.waitpid(pid, 0)  # reap: kernel frees the PCB
+        console.print(f"  waitpid({pid}) called → PCB freed, zombie reaped.  "
+                      f"PID now gone: {procfs.read_stat(pid) is None}")
+        return
+
+    # ── /ps kill <pid> <signal>: send a signal ──────────────────────────────
+    if sub == "kill" and len(parts) >= 3:
+        try:
+            target_pid = int(parts[1])
+            sig_name = parts[2].upper()
+            if not sig_name.startswith("SIG"):
+                sig_name = "SIG" + sig_name
+            sig = signal.Signals[sig_name]
+        except (ValueError, KeyError) as exc:
+            console.print(f"[red]usage: /ps kill <pid> <signal>  ({exc})[/]")
+            return
+        st = procfs.read_stat(target_pid)
+        if st is None:
+            console.print(f"[red]PID {target_pid} does not exist[/]")
+            return
+        console.print(f"Sending [bold]{sig_name}[/] to PID {target_pid} ({st.name})")
+        try:
+            os.kill(target_pid, sig)
+        except PermissionError:
+            console.print("[red]permission denied — you cannot signal this process[/]")
+            return
+        time.sleep(0.2)
+        after = procfs.read_stat(target_pid)
+        outcome = "gone (reaped)" if after is None else f"state now: {after.state_name}"
+        console.print(f"  outcome: [cyan]{outcome}[/]")
+        return
+
+    # ── /ps <integer>: deep PCB view for one process ────────────────────────
+    if sub.isdigit():
+        pid = int(sub)
+        st = procfs.read_stat(pid)
+        if st is None:
+            console.print(f"[red]PID {pid} not found[/]")
+            return
+        status = procfs.read_status(pid)
+        uid = procfs.real_uid(pid)
+        boot_t = procfs.boot_time()
+        started = boot_t + st.starttime / procfs.CLK_TCK
+
+        from rich import box as rbox
+        from rich.table import Table as RTable
+        tbl = RTable(title=f"PCB for PID {pid} — {st.name}", box=rbox.SIMPLE_HEAD, pad_edge=False)
+        tbl.add_column("field", style="bold", min_width=26)
+        tbl.add_column("value")
+        rows = [
+            ("PID",              str(pid)),
+            ("PPID",             str(st.ppid)),
+            ("process group",    str(st.pgrp)),
+            ("session",          str(st.session)),
+            ("user",             procfs.username(uid) + f" (uid {uid})" if uid is not None else "?"),
+            ("state",            f"[bold]{st.state}[/] — {st.state_name}"),
+            ("nice / priority",  f"{st.nice} / {st.priority}"),
+            ("sched policy",     procfs.SCHED_POLICIES.get(st.policy, str(st.policy))),
+            ("CPU: user",        f"{st.utime / procfs.CLK_TCK:.3f} s"),
+            ("CPU: kernel",      f"{st.stime / procfs.CLK_TCK:.3f} s"),
+            ("virtual mem",      fmt_bytes(st.vsize)),
+            ("resident (RSS)",   fmt_bytes(st.rss_bytes)),
+            ("VmPeak",           status.get("VmPeak", "?")),
+            ("VmSwap",           status.get("VmSwap", "0 kB")),
+            ("minor faults",     str(st.minflt)),
+            ("major faults",     str(st.majflt)),
+            ("threads",          str(st.num_threads)),
+            ("started",          fmt_time(started)),
+            ("running for",      fmt_duration(time.time() - started)),
+        ]
+        for k, v in rows:
+            tbl.add_row(k, v)
+        console.print(tbl)
+        return
+
+    # ── /ps (default): process table ────────────────────────────────────────
+    name_filter = sub  # treat non-keyword rest as name filter
+    pids = procfs.list_pids()
+    mem_total = procfs.meminfo().get("MemTotal", 1)
+
+    def _sample(pid_list):
+        out = {}
+        for p in pid_list:
+            st = procfs.read_stat(p)
+            if st is not None:
+                out[p] = st
+        return out
+
+    first = _sample(pids)
+    interval = 0.3
+    t0 = time.monotonic()
+    time.sleep(interval)
+    second = _sample(pids)
+    elapsed = time.monotonic() - t0
+
+    state_legend = {"R": "running", "S": "sleeping", "D": "unint. sleep",
+                    "Z": "zombie", "T": "stopped", "I": "idle kernel"}
+
+    tbl = Table(title="Process table  [dim](from /proc)[/]", box=box.SIMPLE_HEAD, pad_edge=False)
+    for col in ("PID", "PPID", "User", "S", "%CPU", "RSS", "NI", "Command"):
+        tbl.add_column(col, justify="right" if col in ("%CPU", "RSS", "NI") else "left")
+
+    rows_data = []
+    for pid, st in second.items():
+        prev = first.get(pid)
+        cpu = (st.cpu_ticks - prev.cpu_ticks) / procfs.CLK_TCK / elapsed * 100 if prev else 0.0
+        uid = procfs.process_owner(pid)
+        cmd = " ".join(procfs.read_cmdline(pid)) or f"[{st.name}]"
+        if name_filter and name_filter not in st.name.lower() and name_filter not in cmd.lower():
+            continue
+        rows_data.append((pid, st.ppid, procfs.username(uid) if uid is not None else "?",
+                          st.state, cpu, st.rss_bytes, st.nice, cmd))
+    rows_data.sort(key=lambda r: -r[4])  # sort by CPU%
+
+    for pid, ppid, user, state, cpu, rss, nice, cmd in rows_data[:30]:
+        s_style = {"R": "green", "Z": "red", "D": "yellow", "T": "yellow"}.get(state, "")
+        state_cell = f"[{s_style}]{state}[/]" if s_style else state
+        tbl.add_row(str(pid), str(ppid), user[:10], state_cell,
+                    f"{cpu:.1f}", fmt_bytes(rss), str(nice), cmd[:60])
+    console.print(tbl)
+    console.print(
+        "[dim]State codes: " +
+        "  ".join(f"{k}={v}" for k, v in state_legend.items()) + "[/]"
+    )
+    console.print("[dim]Tip: /ps <pid>  deep view   /ps kill <pid> <sig>  send signal   /ps zombie  reaping demo[/]")
+
+
+def _cmd_limits(console: Console, rt: Runtime, rest: str) -> None:
+    """'/limits [stress]' — show active resource limits and optionally demo containment.
+
+    Demonstrates Module 4: rlimits, cgroup v2, OOM killer, SIGXCPU.
+    """
+    import resource, shutil
+    from rich.table import Table
+    from rich import box
+
+    exec_grant = rt.policy.grant("exec")
+    lim = exec_grant.limits if exec_grant else None
+    sandbox = exec_grant.sandbox if exec_grant else "none"
+
+    console.print(f"[bold]Resource limits[/]  [dim](exec grant, sandbox: {sandbox})[/]")
+
+    # ── policy / grant limits ───────────────────────────────────────────────
+    if lim:
+        from agentlayer.tools.exec import format_limits
+        console.print(format_limits(lim, sandbox))
+    else:
+        console.print("[dim](no exec grant configured — no rlimits will be applied to commands)[/]")
+
+    # ── /proc/self/limits (kernel view of our own process) ─────────────────
+    console.print("\n[bold]/proc/self/limits[/]  [dim](current kernel enforcement for this process)[/]")
+    tbl = Table(box=box.SIMPLE_HEAD, pad_edge=False)
+    for col in ("Limit", "Soft", "Hard", "Units"):
+        tbl.add_column(col)
+    try:
+        with open("/proc/self/limits") as f:
+            lines = f.read().splitlines()[1:]  # skip header
+        for line in lines:
+            parts = line.split()
+            if len(parts) >= 3:
+                # columns: "Limit  Soft Limit  Max Limit  Units"
+                # The name can be multi-word; last two fields are values+units
+                name = " ".join(parts[:-3]) or parts[0]
+                soft, hard, units = parts[-3], parts[-2], parts[-1]
+                tbl.add_row(name, soft, hard, units)
+    except OSError as exc:
+        console.print(f"[red]could not read /proc/self/limits: {exc}[/]")
+    else:
+        console.print(tbl)
+
+    # ── stress demo ─────────────────────────────────────────────────────────
+    if rest.strip().lower() == "stress":
+        console.print("\n[bold]Stress demo:[/] forking a memory hog with tight rlimits…")
+        import subprocess, os as _os, signal as _signal
+
+        mem_mb = 32 if lim is None else lim.memory_mb
+        cpu_s  = 5  if lim is None else lim.cpu_seconds
+
+        # Run a Python one-liner that allocates more memory than the limit
+        hog = (
+            f"python3 -c \""
+            f"import resource, sys; "
+            f"resource.setrlimit(resource.RLIMIT_AS, ({mem_mb}*1024*1024, {mem_mb}*1024*1024)); "
+            f"resource.setrlimit(resource.RLIMIT_CPU, ({cpu_s}, {cpu_s})); "
+            f"print('limits set; allocating 2x memory…'); "
+            f"x = bytearray({mem_mb * 2}*1024*1024)"
+            f"\""
+        )
+        console.print(f"  command: [dim]{hog[:120]}[/]")
+        try:
+            proc = subprocess.run(
+                ["bash", "-c", hog], capture_output=True, text=True, timeout=10,
+            )
+            sig_num = -proc.returncode if proc.returncode < 0 else None
+            sig_name = ""
+            if sig_num:
+                try:
+                    sig_name = _signal.Signals(sig_num).name
+                except ValueError:
+                    sig_name = f"signal {sig_num}"
+
+            if proc.returncode == 0:
+                console.print("  [yellow]process finished without being killed — limits may be too generous[/]")
+            elif sig_name in ("SIGSEGV", "SIGBUS"):
+                console.print(f"  [red]process killed: {sig_name}[/]  "
+                              f"(memory limit exceeded: OS/kernel OOM action or RLIMIT_AS enforcement)")
+            elif sig_name == "SIGXCPU":
+                console.print("  [yellow]process killed: SIGXCPU[/]  (CPU time limit exceeded)")
+            else:
+                console.print(f"  [red]process exited {proc.returncode}[/] ({sig_name or 'non-zero exit'})")
+            if proc.stdout:
+                console.print(f"  stdout: [dim]{proc.stdout.strip()[:200]}[/]")
+            if proc.stderr:
+                console.print(f"  stderr: [dim]{proc.stderr.strip()[:200]}[/]")
+        except subprocess.TimeoutExpired:
+            console.print("  [red]timed out — hog ran for more than 10 s (check your limits)[/]")
+        except OSError as exc:
+            console.print(f"  [red]could not fork: {exc}[/]")
+
+
+def _cmd_sched(console: Console, rest: str) -> None:
+    """/sched [all|fcfs|sjf|rr|priority] [quantum=N] — CPU scheduling demo.
+
+    Runs all four algorithms against the same job set and compares them.
+    Demonstrates Module 3: scheduling policies, Gantt charts, waiting/turnaround times.
+    """
+    from agentlayer.jobsched import Job, DEMO_JOBS, run_fcfs, run_sjf, run_rr, run_priority, run_all
+    from rich.table import Table
+    from rich import box
+
+    parts = rest.lower().split()
+    algo = parts[0] if parts else "all"
+    quantum = 2
+    for p in parts:
+        if p.startswith("quantum=") or p.startswith("q="):
+            try:
+                quantum = int(p.split("=")[1])
+            except (ValueError, IndexError):
+                pass
+
+    jobs = DEMO_JOBS
+    console.print(
+        f"[bold]CPU Scheduling demo[/]  [dim]{len(jobs)} jobs, RR quantum={quantum}[/]\n"
+    )
+
+    # ── job table ────────────────────────────────────────────────────────────
+    job_tbl = Table(title="Job set", box=box.SIMPLE_HEAD, pad_edge=False)
+    for col in ("id", "name", "burst (ticks)", "arrival", "priority"):
+        job_tbl.add_column(col, justify="right" if col in ("burst (ticks)", "arrival", "priority") else "left")
+    for j in jobs:
+        job_tbl.add_row(j.id, j.name, str(j.burst), str(j.arrival), str(j.priority))
+    console.print(job_tbl)
+
+    # ── run selected algorithms ──────────────────────────────────────────────
+    algo_map = {
+        "fcfs":     lambda: [run_fcfs(jobs)],
+        "sjf":      lambda: [run_sjf(jobs)],
+        "rr":       lambda: [run_rr(jobs, quantum)],
+        "priority": lambda: [run_priority(jobs)],
+        "all":      lambda: run_all(jobs, quantum),
+    }
+    if algo not in algo_map:
+        console.print(f"[red]unknown algorithm {algo!r}[/]  choices: {', '.join(algo_map)}")
+        return
+
+    results = algo_map[algo]()
+
+    # ── per-algorithm: Gantt + per-job metrics ───────────────────────────────
+    for res in results:
+        console.print(f"\n[bold cyan]{res.algorithm}[/]"
+                      + (f"  [dim]quantum={res.quantum}[/]" if res.quantum else ""))
+        # Gantt
+        console.print(res.gantt_text(width=68))
+        # Per-job metrics table
+        mtbl = Table(box=box.SIMPLE, pad_edge=False)
+        for col in ("job", "name", "burst", "arrival", "finish", "turnaround", "waiting"):
+            mtbl.add_column(col, justify="right" if col not in ("name",) else "left")
+        for m in res.metrics:
+            mtbl.add_row(m.job_id, m.name, str(m.burst), str(m.arrival),
+                         str(m.finish), f"[cyan]{m.turnaround}[/]", f"[yellow]{m.waiting}[/]")
+        console.print(mtbl)
+        console.print(f"  avg waiting: [yellow]{res.avg_waiting:.2f}[/]  "
+                      f"avg turnaround: [cyan]{res.avg_turnaround:.2f}[/]  "
+                      f"CPU util: [green]{res.cpu_util:.1f}%[/]")
+
+    # ── comparison table when running all ────────────────────────────────────
+    if len(results) > 1:
+        console.print("\n[bold]Comparison[/]")
+        cmp_tbl = Table(box=box.SIMPLE_HEAD, pad_edge=False)
+        for col in ("algorithm", "avg waiting", "avg turnaround", "CPU util", "total ticks"):
+            cmp_tbl.add_column(col, justify="right" if col != "algorithm" else "left")
+        for res in results:
+            cmp_tbl.add_row(*res.comparison_row())
+        console.print(cmp_tbl)
+        best_wait = min(results, key=lambda r: r.avg_waiting)
+        best_turn = min(results, key=lambda r: r.avg_turnaround)
+        console.print(
+            f"  best avg waiting: [yellow]{best_wait.algorithm}[/]  "
+            f"  best avg turnaround: [cyan]{best_turn.algorithm}[/]"
+        )
+
+
+def _cmd_ipc(console: Console, rt: Runtime) -> None:
+    """/ipc — privilege separation demo over a Unix domain socket.
+
+    Demonstrates the IPC component: planner (LLM side) never calls the OS
+    directly — all actions go through the executor broker over a Unix socket.
+    """
+    import os, tempfile, threading, time
+    from agentlayer.privbroker import make_demo_broker, DEMO_REQUESTS
+    from rich.table import Table
+    from rich import box
+
+    console.print("[bold]Privilege separation demo[/]  [dim](Unix domain socket IPC)[/]")
+    console.print(
+        "\n[dim]Architecture:[/]\n"
+        "  [bold]Planner[/] (this REPL, PID [cyan]{pid}[/]) — sends JSON requests over a socket\n"
+        "  [bold]Executor[/] (forked child)       — validates policy, replies allow/deny\n".format(pid=os.getpid())
+    )
+
+    sock_path = os.path.join(tempfile.gettempdir(), f"agentlayer-privbroker-{os.getpid()}.sock")
+    workspace = str(rt.policy.workspace)
+    broker = make_demo_broker(workspace)
+
+    from agentlayer.privbroker import PrivBroker
+
+    # ── fork executor ────────────────────────────────────────────────────────
+    child_pid = os.fork()
+    if child_pid == 0:
+        # executor process
+        try:
+            broker.serve(sock_path, max_requests=len(DEMO_REQUESTS) + 5)
+        except Exception:
+            pass
+        os._exit(0)
+
+    # parent = planner
+    console.print(f"  Executor PID: [bold]{child_pid}[/]  socket: [dim]{sock_path}[/]")
+
+    # give executor a moment to bind
+    for _ in range(20):
+        if os.path.exists(sock_path):
+            break
+        time.sleep(0.05)
+
+    if not os.path.exists(sock_path):
+        console.print("[red]executor did not bind the socket in time[/]")
+        os.waitpid(child_pid, 0)
+        return
+
+    # ── send demo requests ───────────────────────────────────────────────────
+    tbl = Table(title="Planner → Executor wire frames", box=box.SIMPLE_HEAD, pad_edge=False)
+    for col in ("label", "request", "verdict", "reason"):
+        tbl.add_column(col, overflow="fold")
+
+    for req_tmpl in DEMO_REQUESTS:
+        req = {k: v.replace("{workspace}", workspace) if isinstance(v, str) else v
+               for k, v in req_tmpl.items() if k != "label"}
+        label = req_tmpl.get("label", "")
+        try:
+            resp = PrivBroker.send(sock_path, req, timeout=3.0)
+        except Exception as exc:
+            resp = {"ok": False, "verdict": "error", "reason": str(exc)}
+
+        ok = resp.get("ok", False)
+        verdict = resp.get("verdict", "?")
+        reason = resp.get("reason", "")
+        color = "green" if ok else "red"
+        tbl.add_row(
+            label,
+            str({k: v for k, v in req.items()})[:70],
+            f"[{color}]{verdict}[/]",
+            reason[:80],
+        )
+        time.sleep(0.02)
+
+    console.print(tbl)
+
+    # ── teardown ─────────────────────────────────────────────────────────────
+    try:
+        os.waitpid(child_pid, 0)
+    except ChildProcessError:
+        pass
+    try:
+        os.unlink(sock_path)
+    except OSError:
+        pass
+
+    console.print(
+        "\n[dim]Key insight: the planner never called open(2), execve(2) or connect(2) directly.\n"
+        "Every OS interaction was mediated by the executor via a validated JSON protocol.\n"
+        "This mirrors microkernel design (L4/seL4) and capability-based systems (Capsicum).[/]"
+    )
+
+
+def _cmd_matrix(console: Console, rt: Runtime) -> None:
+    """/matrix — Lampson access matrix grid + capability token lifecycle.
+
+    Demonstrates the access matrix security model: domain × right cells show
+    whether each capability is granted unconditionally, needs confirmation,
+    held via a temporary token, or explicitly denied.
+    """
+    print_matrix(console, rt.policy, rt.broker)
+
+
+
 def _slash(text: str, agent: Agent, rt: Runtime, llm, console: Console, chat: dict) -> bool | str | None:
     cmd, _, rest = text.partition(" ")
     rest = rest.strip()
@@ -232,6 +775,18 @@ def _slash(text: str, agent: Agent, rt: Runtime, llm, console: Console, chat: di
         console.print(HELP)
     elif cmd == "/policy":
         print_policy(console, rt.policy, rt.broker)
+    elif cmd == "/matrix":
+        _cmd_matrix(console, rt)
+    elif cmd == "/trace":
+        _cmd_trace(console, rt, rest)
+    elif cmd == "/ps":
+        _cmd_ps(console, rt, rest)
+    elif cmd == "/limits":
+        _cmd_limits(console, rt, rest)
+    elif cmd == "/sched":
+        _cmd_sched(console, rest)
+    elif cmd == "/ipc":
+        _cmd_ipc(console, rt)
     elif cmd == "/tools":
         _print_tools(console, rt.policy, agent)
     elif cmd == "/audit":

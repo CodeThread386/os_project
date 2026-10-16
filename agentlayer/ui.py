@@ -312,3 +312,167 @@ def audit_table(entries: list[dict]) -> Table:
         table.add_row(str(e.get("seq", "")), _local_time(e.get("ts", "")), e.get("event", ""), e.get("tool", ""),
                       f"[{color}]{verdict}[/]" if verdict else "", escape(" ".join(str(detail).split())[:110]))
     return table
+
+
+# -------------------------------------------------------- Lampson matrix view
+
+
+# Domains (rows of the Lampson access matrix).  In this system there is a
+# single agent domain plus an optional "admin" domain when sys.admin is granted.
+_DOMAINS = [
+    ("agent",  "Agent (LLM process)"),
+    ("admin",  "Agent elevated (sudo)"),
+    ("temp",   "Temporary grant"),
+]
+
+# Rights that appear as columns.  Same order as MATRIX_COLUMNS but with
+# friendlier names for the compact grid.
+_GRID_RIGHTS: list[tuple[str, str]] = [
+    ("fs.read",       "read"),
+    ("fs.write",      "write"),
+    ("fs.delete",     "del"),
+    ("exec",          "exec"),
+    ("proc.read",     "ps"),
+    ("proc.signal",   "kill"),
+    ("proc.priority", "nice"),
+    ("net.read",      "net"),
+    ("sys.read",      "info"),
+    ("sys.logs",      "logs"),
+    ("gui.launch",    "apps"),
+    ("gui.windows",   "win"),
+    ("gui.screen",    "shot"),
+    ("gui.clipboard", "clip"),
+    ("sys.admin",     "root"),
+    ("memory",        "mem"),
+    ("task.schedule", "tasks"),
+    ("cap.request",   "jit"),
+]
+
+
+def print_matrix(console: Console, policy: "Policy", broker=None) -> None:  # noqa: F821
+    """Print the Lampson access matrix as a compact domain × right grid.
+
+    Rows are *domains* (agent, agent-as-root, temporary-grant holder).
+    Columns are the 18 rights defined in the policy.
+    Each cell shows:
+
+      ✔   granted unconditionally
+      ~   granted with user confirmation each time
+      T   held via a temporary (expiring) token
+      ·   not granted
+      ✖   explicitly denied (deny rule applies)
+
+    After the grid, active capability tokens are listed with their expiry.
+    The invariants (always-on protections independent of policy) are appended
+    at the bottom so the viewer can see the full defense-in-depth picture.
+    """
+    from agentlayer.policy import RIGHTS  # avoid circular at module level
+
+    has_right = {g.right for g in policy.grants}
+    has_admin  = policy.has("sys.admin")
+    grants_by_right = {g.right: g for g in policy.grants}
+
+    temp_rights: set[str] = set()
+    active_tokens = broker.active_grants() if broker is not None else []
+    for tg in active_tokens:
+        temp_rights.add(tg.right)
+
+    # ── build the grid ─────────────────────────────────────────────────────
+    visible_rights = [
+        (right, label)
+        for right, label in _GRID_RIGHTS
+        if right in has_right or right in temp_rights
+    ]
+
+    table = Table(
+        title=f"[bold]Lampson access matrix[/]  ·  policy: [cyan]{policy.name}[/]",
+        caption=(
+            "[green]✔[/] unconditional  "
+            "[yellow]~[/] needs confirmation  "
+            "[magenta]T[/] temporary token  "
+            "[dim]·[/] not granted  "
+            "[red]✖[/] deny rule"
+        ),
+        caption_justify="left",
+        box=box.SIMPLE_HEAD,
+        show_lines=True,
+        title_justify="left",
+        pad_edge=False,
+    )
+    table.add_column("domain", style="bold", min_width=24)
+    for _, label in visible_rights:
+        table.add_column(label, justify="center", min_width=4)
+
+    def _cell(domain: str, right: str) -> str:
+        # deny rules override everything for filesystem rights
+        if right.startswith("fs.") and policy.deny:
+            return "[red]✖[/]"   # simplified: deny rules exist; show ✖ for fs cols
+
+        if domain == "temp":
+            return "[magenta]T[/]" if right in temp_rights else "[dim]·[/]"
+
+        if domain == "admin":
+            # admin domain only has sys.admin and whatever root programs need
+            if right == "sys.admin" and has_admin:
+                return "[yellow]~[/]"     # always needs confirmation
+            return "[dim]·[/]"
+
+        # agent domain
+        if right not in has_right:
+            return "[dim]·[/]"
+        g = grants_by_right[right]
+        if g.confirm:
+            return "[yellow]~[/]"
+        return "[green]✔[/]"
+
+    # agent row
+    table.add_row(
+        "Agent (LLM)",
+        *(_cell("agent", r) for r, _ in visible_rights),
+    )
+    if has_admin:
+        table.add_row(
+            "Agent as root (sudo)",
+            *(_cell("admin", r) for r, _ in visible_rights),
+        )
+    if active_tokens:
+        table.add_row(
+            f"Temp grants ({len(active_tokens)} active)",
+            *(_cell("temp", r) for r, _ in visible_rights),
+        )
+    if policy.deny:
+        table.add_row(
+            f"[red]Deny rules ({len(policy.deny)})[/]",
+            *("[red]✖[/]" if r.startswith("fs.") else "[dim]·[/]" for r, _ in visible_rights),
+        )
+
+    console.print(table)
+
+    # ── active capability tokens ───────────────────────────────────────────
+    if active_tokens:
+        console.print("\n[bold]Active capability tokens[/] (revoke with /revoke ID):")
+        tok_table = Table(box=box.SIMPLE, pad_edge=False)
+        for col in ("id", "right", "covers", "expires", "reason"):
+            tok_table.add_column(col, overflow="fold")
+        for tg in active_tokens:
+            tok_table.add_row(
+                f"[magenta]{tg.id}[/]",
+                tg.right,
+                escape(tg.target),
+                tg.remaining(),
+                escape(tg.reason[:60]),
+            )
+        console.print(tok_table)
+
+    # ── deny rules ────────────────────────────────────────────────────────
+    if policy.deny:
+        console.print("\n[bold]Deny rules[/] (override every grant, checked after symlink resolution):")
+        for rule in policy.deny:
+            console.print(f"  [red]✖[/] {escape(rule.raw)}", style="dim")
+
+    # ── invariants (mechanism, not policy) ────────────────────────────────
+    console.print("\n[bold]Built-in invariants[/] (hold under every policy — part of the mechanism, not the rules):")
+    for i, line in enumerate(INVARIANTS, 1):
+        console.print(f"  {i:>2}. {line}", style="dim")
+
+    console.print(f"\n[dim]policy file: {policy.source}  |  workspace: {policy.workspace}[/]")

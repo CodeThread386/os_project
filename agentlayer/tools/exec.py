@@ -1,4 +1,23 @@
-"""The run_command tool: allow-listed programs, no shell, optional sandbox."""
+"""The run_command tool: allow-listed programs, no shell, optional sandbox.
+
+Resource containment
+--------------------
+Every subprocess goes through two layers of resource enforcement:
+
+1. **rlimits** (``setrlimit``, always active): ``RLIMIT_CPU``, ``RLIMIT_AS``,
+   ``RLIMIT_FSIZE`` and ``RLIMIT_NOFILE`` are applied in the forked child
+   before ``execve()``, from the ``ExecLimits`` in the exec grant.
+
+2. **cgroup v2** (optional, requires systemd user session): when
+   ``systemd-run`` is available, commands are placed in a transient
+   per-invocation scope with ``MemoryMax`` and ``CPUQuota`` derived from the
+   same limits.  The kernel then enforces memory via the cgroup OOM killer
+   *in addition to* the process-level ``RLIMIT_AS``, giving a harder
+   guarantee that cannot be worked around by mapping shared memory.
+
+If ``systemd-run`` fails or is unavailable, execution falls back to
+rlimits-only silently — the grant limits still apply.
+"""
 
 from __future__ import annotations
 
@@ -6,10 +25,12 @@ import glob
 import os
 import pwd
 import shutil
+import subprocess
 
 from agentlayer import safeio
 from agentlayer.broker import Requirement
 from agentlayer.executor import CommandSyntaxError, run_pipeline, split_pipeline
+from agentlayer.policy import ExecLimits
 from agentlayer.tools.base import Clip, Tool, ToolArgError, ToolContext, ToolOutput, fmt_bytes, param, register
 
 SAFE_PATH = "/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin"
@@ -85,6 +106,78 @@ def _child_env(ctx: ToolContext) -> dict[str, str]:
     }
 
 
+# ──────────────────────────── cgroup v2 helper ──────────────────────────────
+
+def _systemd_run_prefix(limits: ExecLimits, scope_name: str) -> list[str] | None:
+    """Return a ``systemd-run`` prefix that wraps a command in a cgroup scope.
+
+    Returns ``None`` when systemd-run is unavailable or the user session is not
+    running, so the caller falls back to rlimits-only containment.
+
+    The scope enforces:
+    * ``MemoryMax``  — hard memory ceiling (cgroup OOM killer)
+    * ``CPUQuota``   — % of one CPU second per real second (cgroup CPU controller)
+    """
+    sdr = shutil.which("systemd-run")
+    if sdr is None:
+        return None
+    try:
+        probe = subprocess.run(
+            ["systemctl", "--user", "is-system-running"],
+            capture_output=True, text=True, timeout=2,
+        )
+        if probe.stdout.strip() not in ("running", "degraded"):
+            return None
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    # CPUQuota: use cpu_seconds as a % of one core (e.g. 30 s limit → 30%)
+    cpu_pct = min(limits.cpu_seconds * 100, 900)  # cap at 900% (9 cores)
+    mem_bytes = limits.memory_mb * 1024 * 1024
+    return [
+        sdr, "--user", "--scope", f"--unit={scope_name}",
+        f"-p", f"MemoryMax={mem_bytes}",
+        f"-p", f"MemorySwapMax=0",
+        f"-p", f"CPUQuota={cpu_pct}%",
+        "--",
+    ]
+
+
+_scope_counter = 0  # monotonically increasing scope ID per process lifetime
+
+
+def _wrap_with_cgroup(program: str, argv: list[str], limits: ExecLimits) -> tuple[str, list[str]]:
+    """Optionally wrap (program, argv) inside a transient systemd-run scope.
+
+    On success the returned argv starts with ``systemd-run`` and the cgroup
+    limits are enforced by the kernel in addition to the per-process rlimits
+    applied inside the forked child.  On failure the original (program, argv)
+    is returned unchanged so execution degrades gracefully.
+    """
+    global _scope_counter
+    _scope_counter += 1
+    scope = f"agentlayer-cmd-{os.getpid()}-{_scope_counter}.scope"
+    prefix = _systemd_run_prefix(limits, scope)
+    if prefix is None:
+        return program, argv
+    new_argv = prefix + [program] + argv[1:]
+    return prefix[0], new_argv   # executable is systemd-run
+
+
+# ──────────────────────────────────────────────── run tool ───────────────────
+
+
+def format_limits(limits: ExecLimits, sandbox_mode: str) -> str:
+    """One-liner description of the resource limits for the /limits command."""
+    cgroups = "cgroup v2 via systemd-run" if shutil.which("systemd-run") else "rlimits only (no systemd-run)"
+    return (
+        f"CPU time: {limits.cpu_seconds}s (RLIMIT_CPU → SIGXCPU)  "
+        f"virtual memory: {limits.memory_mb} MB (RLIMIT_AS)  "
+        f"file size: {limits.file_size_mb} MB (RLIMIT_FSIZE → SIGXFSZ)  "
+        f"open files: {limits.open_files} (RLIMIT_NOFILE)  "
+        f"containment: {cgroups}  sandbox: {sandbox_mode}"
+    )
+
+
 def _run(args: dict, ctx: ToolContext, decision) -> ToolOutput:
     grant = decision.grant("exec")
     # Execute exactly what the broker approved: no second parse, no second glob expansion.
@@ -100,8 +193,19 @@ def _run(args: dict, ctx: ToolContext, decision) -> ToolOutput:
             program = shutil.which(argv[0], path=SAFE_PATH)
         if program is None:
             return ToolOutput.fail(f"'{argv[0]}' is allowed but not installed on this system")
-        stages.append(ctx.sandbox.wrap(program, argv, cwd=cwd, workspace=ctx.workspace, network=network,
-                                       masks=masks, mounts=mounts))
+        wrapped_program, wrapped_argv = ctx.sandbox.wrap(
+            program, argv, cwd=cwd, workspace=ctx.workspace, network=network,
+            masks=masks, mounts=mounts,
+        )
+        # Optionally place the command in a cgroup v2 scope for stronger resource
+        # enforcement.  This only applies when the sandbox is NOT active (bwrap
+        # already provides namespace isolation); inside bwrap systemd-run is not
+        # available anyway.
+        if not ctx.sandbox.active:
+            wrapped_program, wrapped_argv = _wrap_with_cgroup(
+                wrapped_program, wrapped_argv, grant.limits
+            )
+        stages.append((wrapped_program, wrapped_argv))
     timeout = min(args.get("timeout") or grant.timeout, grant.max_timeout)
     cwd_fd = safeio.open_dir(cwd)
     try:
